@@ -678,6 +678,133 @@ def pesapal_check(tracking_id):
     return jsonify(get_transaction_status(tracking_id))
 
 
+# ==================== PAWAPAY ====================
+
+@app.route("/api/pawapay/status", methods=["GET"])
+def pawapay_status():
+    from pawapay import is_configured, PAWAPAY_SANDBOX
+    return jsonify({
+        "configured": is_configured(),
+        "sandbox": PAWAPAY_SANDBOX,
+        "message": "PawaPay ready" if is_configured() else "Add PAWAPAY_API_TOKEN on Render"
+    })
+
+
+@app.route("/api/pawapay/initiate", methods=["POST"])
+@token_required
+def pawapay_initiate():
+    from pawapay import request_deposit, is_configured
+
+    data = request.get_json() or {}
+    amount = float(data.get("amount", 0))
+    phone = (data.get("phone") or "").strip()
+    country = (data.get("country") or "KEN").upper()
+
+    if amount < 5:
+        return jsonify({"error": "Minimum deposit is $5"}), 400
+    if not phone:
+        return jsonify({"error": "Phone number is required"}), 400
+
+    if not is_configured():
+        # Demo fallback so UI still works
+        user_id = request.current_user["id"]
+        ref = f"PAWA-DEMO-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (amount, user_id))
+        cursor.execute(
+            """INSERT INTO transactions (user_id, type, amount, description, status, reference)
+               VALUES (?, 'deposit', ?, ?, 'completed', ?)""",
+            (user_id, amount, f"PawaPay DEMO deposit ({country})", ref)
+        )
+        conn.commit()
+        bal = cursor.execute("SELECT balance FROM users WHERE id = ?", (user_id,)).fetchone()["balance"]
+        conn.close()
+        return jsonify({
+            "demo": True,
+            "message": f"DEMO: ${amount} credited (PawaPay token not on server yet)",
+            "new_balance": round(bal, 2),
+            "reference": ref
+        })
+
+    result = request_deposit(amount=amount, phone=phone, country=country)
+    if result.get("error") and not result.get("status"):
+        return jsonify({"error": result["error"]}), 400
+
+    status = (result.get("status") or "").upper()
+    deposit_id = result.get("depositId") or result.get("deposit_id")
+
+    user_id = request.current_user["id"]
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        """INSERT INTO transactions (user_id, type, amount, description, status, reference)
+           VALUES (?, 'deposit', ?, ?, 'pending', ?)""",
+        (user_id, amount, f"PawaPay deposit ({country})", deposit_id)
+    )
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "demo": False,
+        "status": status,
+        "depositId": deposit_id,
+        "message": "Payment request sent. Approve on your phone (PIN).",
+        "raw": {k: result.get(k) for k in ("status", "rejectionReason", "failureReason") if result.get(k)}
+    })
+
+
+@app.route("/api/pawapay/callback", methods=["GET", "POST"])
+def pawapay_callback():
+    """PawaPay deposit/payout status callback"""
+    from pawapay import check_deposit
+
+    data = request.get_json(silent=True) or {}
+    # Also accept query params
+    if not data:
+        data = request.args.to_dict()
+
+    deposit_id = (
+        data.get("depositId")
+        or data.get("deposit_id")
+        or data.get("id")
+    )
+    status = (data.get("status") or "").upper()
+
+    # If only ID, fetch status
+    if deposit_id and not status:
+        info = check_deposit(deposit_id)
+        status = (info.get("status") or "").upper()
+        data = info
+
+    if not deposit_id:
+        return jsonify({"error": "Missing depositId"}), 400
+
+    completed = status in ("COMPLETED", "ACCEPTED", "SUCCESS")
+
+    conn = get_db()
+    cursor = conn.cursor()
+    tx = cursor.execute(
+        "SELECT * FROM transactions WHERE reference = ? AND status = 'pending'",
+        (deposit_id,)
+    ).fetchone()
+
+    if tx and completed:
+        cursor.execute(
+            "UPDATE users SET balance = balance + ? WHERE id = ?",
+            (tx["amount"], tx["user_id"])
+        )
+        cursor.execute(
+            "UPDATE transactions SET status = 'completed' WHERE id = ?",
+            (tx["id"],)
+        )
+        conn.commit()
+        print(f"[PawaPay] Credited ${tx['amount']} user={tx['user_id']} ref={deposit_id}")
+
+    conn.close()
+    return jsonify({"status": "ok", "payment_status": status})
+
+
 @app.route("/api/invest", methods=["POST"])
 @token_required
 def invest():

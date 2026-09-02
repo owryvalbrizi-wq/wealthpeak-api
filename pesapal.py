@@ -24,7 +24,7 @@ else:
     BASE_URL = "https://pay.pesapal.com/v3"
 
 # Your website callback (change when you host the site)
-CALLBACK_URL = os.environ.get("PESAPAL_CALLBACK_URL", "http://127.0.0.1:8080/dashboard.html")
+CALLBACK_URL = os.environ.get("PESAPAL_CALLBACK_URL", "https://wealthpeak-investments.netlify.app/dashboard.html")
 
 
 def is_configured():
@@ -37,10 +37,12 @@ def get_access_token():
     if not is_configured():
         return None
 
+    key = (PESAPAL_CONSUMER_KEY or "").strip()
+    secret = (PESAPAL_CONSUMER_SECRET or "").strip()
     url = f"{BASE_URL}/api/Auth/RequestToken"
     payload = {
-        "consumer_key": PESAPAL_CONSUMER_KEY,
-        "consumer_secret": PESAPAL_CONSUMER_SECRET
+        "consumer_key": key,
+        "consumer_secret": secret
     }
     headers = {
         "Accept": "application/json",
@@ -48,9 +50,12 @@ def get_access_token():
     }
 
     try:
-        res = requests.post(url, json=payload, headers=headers, timeout=15)
-        data = res.json()
-        return data.get("token")
+        res = requests.post(url, json=payload, headers=headers, timeout=20)
+        data = res.json() if res.content else {}
+        token = data.get("token")
+        if not token:
+            print(f"[Pesapal] Auth failed status={res.status_code} body={data}")
+        return token
     except Exception as e:
         print(f"[Pesapal] Token error: {e}")
         return None
