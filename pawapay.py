@@ -8,7 +8,6 @@ import requests
 from datetime import datetime, timezone
 
 PAWAPAY_API_TOKEN = os.environ.get("PAWAPAY_API_TOKEN", "").strip()
-# sandbox by default until you switch to live
 PAWAPAY_SANDBOX = os.environ.get("PAWAPAY_SANDBOX", "true").lower() == "true"
 
 if PAWAPAY_SANDBOX:
@@ -16,7 +15,13 @@ if PAWAPAY_SANDBOX:
 else:
     BASE_URL = "https://api.pawapay.io"
 
-# Country + default provider mapping for your markets
+USD_RATES = {
+    "KEN": 130.0,
+    "ZMB": 27.0,
+    "MWI": 1730.0,
+    "ZWE": 1.0,
+}
+
 PROVIDERS = {
     "KEN": {"currency": "KES", "correspondent": "MPESA_KEN", "name": "Kenya M-Pesa"},
     "ZMB": {"currency": "ZMW", "correspondent": "MTN_MOMO_ZMB", "name": "Zambia MTN"},
@@ -37,15 +42,8 @@ def _headers():
 
 
 def normalize_phone(phone: str, country: str) -> str:
-    """Digits only, with country code, no leading + or 0."""
     digits = "".join(c for c in phone if c.isdigit())
-    # strip leading zero if present after country code attempts
-    prefixes = {
-        "KEN": "254",
-        "ZMB": "260",
-        "MWI": "265",
-        "ZWE": "263",
-    }
+    prefixes = {"KEN": "254", "ZMB": "260", "MWI": "265", "ZWE": "263"}
     cc = prefixes.get(country, "")
     if digits.startswith("0") and cc:
         digits = cc + digits[1:]
@@ -55,27 +53,28 @@ def normalize_phone(phone: str, country: str) -> str:
     return digits
 
 
-def request_deposit(amount: float, phone: str, country: str = "KEN", description: str = "WealthPeak Deposit"):
-    """
-    Initiate a mobile money deposit via PawaPay.
-    amount is in USD for our app — for sandbox we send as local currency units
-    for simplicity (you can convert rates later).
-    """
+def usd_to_local(amount_usd: float, country: str) -> str:
+    rate = USD_RATES.get(country, 1.0)
+    local = max(1, round(float(amount_usd) * rate))
+    return str(local)
+
+
+def request_deposit(amount_usd: float, phone: str, country: str = "KEN", description: str = "WealthPeak"):
     if not is_configured():
         return {"error": "PawaPay API token not configured", "demo": True}
 
     meta = PROVIDERS.get(country, PROVIDERS["KEN"])
     deposit_id = str(uuid.uuid4())
     msisdn = normalize_phone(phone, country)
+    local_amount = usd_to_local(amount_usd, country)
 
-    # Statement description: 4–22 characters required by PawaPay
     stmt = (description or "WealthPeak")[:22]
     if len(stmt) < 4:
         stmt = "WealthPeak Pay"
 
     payload = {
         "depositId": deposit_id,
-        "amount": f"{float(amount):.0f}",
+        "amount": local_amount,
         "currency": meta["currency"],
         "correspondent": meta["correspondent"],
         "payer": {
@@ -87,6 +86,7 @@ def request_deposit(amount: float, phone: str, country: str = "KEN", description
         "country": country,
         "metadata": [
             {"fieldName": "platform", "fieldValue": "WealthPeak"},
+            {"fieldName": "usdAmount", "fieldValue": str(amount_usd)},
         ],
     }
 
@@ -98,12 +98,25 @@ def request_deposit(amount: float, phone: str, country: str = "KEN", description
             timeout=30,
         )
         data = res.json() if res.content else {}
+        print(f"[PawaPay] status={res.status_code} body={data}")
         data["_http_status"] = res.status_code
-        data["depositId"] = deposit_id
+        data["depositId"] = data.get("depositId") or deposit_id
         data["msisdn"] = msisdn
+        data["local_amount"] = local_amount
+        data["currency"] = meta["currency"]
         data["correspondent"] = meta["correspondent"]
+        if res.status_code >= 400:
+            reason = (
+                data.get("failureReason")
+                or data.get("rejectionReason")
+                or data.get("errorMessage")
+                or data.get("message")
+                or str(data)
+            )
+            data["error"] = reason
         return data
     except Exception as e:
+        print(f"[PawaPay] exception: {e}")
         return {"error": str(e), "depositId": deposit_id}
 
 
@@ -116,6 +129,8 @@ def check_deposit(deposit_id: str):
             headers=_headers(),
             timeout=20,
         )
-        return res.json() if res.content else {}
+        data = res.json() if res.content else {}
+        print(f"[PawaPay] check {deposit_id}: {data}")
+        return data
     except Exception as e:
         return {"error": str(e)}
