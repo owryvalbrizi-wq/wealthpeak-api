@@ -1,5 +1,6 @@
 """
 PawaPay Merchant API helper (Sandbox + Live)
+Auto-falls back to sandbox if live auth fails (common when token is sandbox-only).
 """
 
 import os
@@ -9,11 +10,6 @@ from datetime import datetime, timezone
 
 PAWAPAY_API_TOKEN = os.environ.get("PAWAPAY_API_TOKEN", "").strip()
 PAWAPAY_SANDBOX = os.environ.get("PAWAPAY_SANDBOX", "true").lower() == "true"
-
-if PAWAPAY_SANDBOX:
-    BASE_URL = "https://api.sandbox.pawapay.io"
-else:
-    BASE_URL = "https://api.pawapay.io"
 
 USD_RATES = {
     "KEN": 130.0,
@@ -38,6 +34,7 @@ def _headers():
     return {
         "Authorization": f"Bearer {PAWAPAY_API_TOKEN}",
         "Content-Type": "application/json",
+        "Accept": "application/json",
     }
 
 
@@ -57,6 +54,19 @@ def usd_to_local(amount_usd: float, country: str) -> str:
     rate = USD_RATES.get(country, 1.0)
     local = max(1, round(float(amount_usd) * rate))
     return str(local)
+
+
+def _post_deposit(base_url: str, payload: dict) -> dict:
+    res = requests.post(
+        f"{base_url}/deposits",
+        json=payload,
+        headers=_headers(),
+        timeout=30,
+    )
+    data = res.json() if res.content else {}
+    data["_http_status"] = res.status_code
+    data["_base_url"] = base_url
+    return data
 
 
 def request_deposit(amount_usd: float = None, phone: str = "", country: str = "KEN", description: str = "WealthPeak", amount: float = None):
@@ -92,27 +102,36 @@ def request_deposit(amount_usd: float = None, phone: str = "", country: str = "K
         ],
     }
 
+    primary = "https://api.sandbox.pawapay.io" if PAWAPAY_SANDBOX else "https://api.pawapay.io"
+    secondary = "https://api.pawapay.io" if PAWAPAY_SANDBOX else "https://api.sandbox.pawapay.io"
+
     try:
-        res = requests.post(
-            f"{BASE_URL}/deposits",
-            json=payload,
-            headers=_headers(),
-            timeout=30,
-        )
-        data = res.json() if res.content else {}
-        print(f"[PawaPay] status={res.status_code} body={data}")
-        data["_http_status"] = res.status_code
-        data["depositId"] = data.get("depositId") or deposit_id
+        data = _post_deposit(primary, payload)
+        print(f"[PawaPay] primary {primary} status={data.get('_http_status')} body={data}")
+
+        err_text = str(data.get("errorMessage") or data.get("message") or data.get("error") or data).lower()
+        auth_fail = data.get("_http_status") in (401, 403) or "authentication" in err_text or "unauthorized" in err_text
+
+        if auth_fail and primary != secondary:
+            print(f"[PawaPay] auth failed on primary, retrying {secondary}")
+            payload["depositId"] = str(uuid.uuid4())
+            data = _post_deposit(secondary, payload)
+            print(f"[PawaPay] secondary status={data.get('_http_status')} body={data}")
+            data["_retried_sandbox"] = secondary.endswith("sandbox.pawapay.io")
+
+        data["depositId"] = data.get("depositId") or payload["depositId"]
         data["msisdn"] = msisdn
         data["local_amount"] = local_amount
         data["currency"] = meta["currency"]
         data["correspondent"] = meta["correspondent"]
-        if res.status_code >= 400:
+
+        if data.get("_http_status", 200) >= 400:
             reason = (
                 data.get("failureReason")
                 or data.get("rejectionReason")
                 or data.get("errorMessage")
                 or data.get("message")
+                or data.get("error")
                 or str(data)
             )
             data["error"] = reason
@@ -125,14 +144,20 @@ def request_deposit(amount_usd: float = None, phone: str = "", country: str = "K
 def check_deposit(deposit_id: str):
     if not is_configured():
         return {"error": "Not configured"}
-    try:
-        res = requests.get(
-            f"{BASE_URL}/deposits/{deposit_id}",
-            headers=_headers(),
-            timeout=20,
-        )
-        data = res.json() if res.content else {}
-        print(f"[PawaPay] check {deposit_id}: {data}")
-        return data
-    except Exception as e:
-        return {"error": str(e)}
+    urls = [
+        "https://api.sandbox.pawapay.io",
+        "https://api.pawapay.io",
+    ] if PAWAPAY_SANDBOX else [
+        "https://api.pawapay.io",
+        "https://api.sandbox.pawapay.io",
+    ]
+    for base in urls:
+        try:
+            res = requests.get(f"{base}/deposits/{deposit_id}", headers=_headers(), timeout=20)
+            if res.status_code < 400:
+                data = res.json() if res.content else {}
+                data["_base_url"] = base
+                return data
+        except Exception:
+            continue
+    return {"error": "Could not check deposit status"}
