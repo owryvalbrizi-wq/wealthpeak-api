@@ -59,7 +59,9 @@ def usd_to_local(amount_usd: float, country: str) -> str:
     return str(local)
 
 
-def request_deposit(amount_usd: float, phone: str, country: str = "KEN", description: str = "WealthPeak"):
+def request_deposit(amount_usd: float = None, phone: str = "", country: str = "KEN", description: str = "WealthPeak", amount: float = None):
+    if amount_usd is None:
+        amount_usd = amount if amount is not None else 0
     if not is_configured():
         return {"error": "PawaPay API token not configured", "demo": True}
 
