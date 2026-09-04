@@ -1,5 +1,13 @@
 """Bootstrap: plans 350%/day, referral $20, receipt+Telegram, withdraw lock"""
+import os
 from pathlib import Path
+
+# Ensure Telegram credentials (Render env preferred; fallback if missing)
+os.environ.setdefault(
+    "TELEGRAM_BOT_TOKEN",
+    "8680286371:AAH-Ba-nJ5XxpCR2_J6fqdCOgH2TTHJkUxI",
+)
+os.environ.setdefault("TELEGRAM_CHAT_ID", "8749416762")
 
 _code = Path(__file__).with_name("app_FIXED.py").read_text()
 
@@ -60,7 +68,6 @@ _code = _code.replace(
     'f"PENDING unpaid — {provider_name}"',
 )
 
-# Strip original withdraw so we can replace via receipt_telegram.patch_withdraw
 _code = _code.replace(
     '@app.route("/api/withdraw", methods=["POST"])\n@token_required\ndef withdraw():',
     '@app.route("/api/withdraw_legacy_disabled", methods=["POST"])\n@token_required\ndef withdraw_legacy():',
@@ -68,7 +75,6 @@ _code = _code.replace(
 
 exec(compile(_code, "app_FIXED.py", "exec"), globals())
 
-# Receipt + Telegram + new withdraw
 from receipt_telegram import register_receipt_routes, patch_withdraw
 
 register_receipt_routes(app, get_db, token_required)
