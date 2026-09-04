@@ -1,5 +1,6 @@
-"""Receipt uploads, Telegram notify, approve/reject, withdraw after plan end."""
+"""Receipt uploads, Telegram notify with Approve/Reject buttons."""
 import base64
+import json
 import datetime
 import os
 import re
@@ -44,7 +45,19 @@ def _plan_amounts(get_db):
     return {float(r["min_amount"]) for r in rows}
 
 
-def _telegram_send(text, photo_b64=None):
+def _approve_keyboard(rid):
+    """Inline Approve / Reject buttons."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "\u2705 Approve", "callback_data": f"APPROVE:{rid}"},
+                {"text": "\u274c Reject", "callback_data": f"REJECT:{rid}"},
+            ]
+        ]
+    }
+
+
+def _telegram_send(text, photo_b64=None, reply_markup=None):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return None
     base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
@@ -55,24 +68,74 @@ def _telegram_send(text, photo_b64=None):
                 raw = raw.split(",", 1)[1]
             data = base64.b64decode(raw)
             files = {"photo": ("receipt.jpg", data)}
+            form = {"chat_id": TELEGRAM_CHAT_ID, "caption": text[:1000]}
+            if reply_markup:
+                form["reply_markup"] = json.dumps(reply_markup)
             r = requests.post(
                 f"{base}/sendPhoto",
-                data={"chat_id": TELEGRAM_CHAT_ID, "caption": text[:1000]},
+                data=form,
                 files=files,
                 timeout=30,
             )
         else:
+            payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+            if reply_markup:
+                payload["reply_markup"] = reply_markup
             r = requests.post(
                 f"{base}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+                json=payload,
                 timeout=20,
             )
         j = r.json()
         if j.get("ok"):
             return str(j["result"].get("message_id", ""))
+        print("telegram api", j)
     except Exception as e:
         print("telegram error", e)
     return None
+
+
+def _telegram_answer_callback(callback_query_id, text):
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+            json={"callback_query_id": callback_query_id, "text": text, "show_alert": False},
+            timeout=15,
+        )
+    except Exception as e:
+        print("telegram callback answer error", e)
+
+
+def _telegram_edit_caption(chat_id, message_id, caption):
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageCaption",
+            json={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "caption": caption[:1000],
+                "reply_markup": {"inline_keyboard": []},
+            },
+            timeout=15,
+        )
+    except Exception:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText",
+                json={
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": caption[:1000],
+                    "reply_markup": {"inline_keyboard": []},
+                },
+                timeout=15,
+            )
+        except Exception as e:
+            print("telegram edit error", e)
 
 
 def register_receipt_routes(app, get_db, token_required):
@@ -91,10 +154,8 @@ def register_receipt_routes(app, get_db, token_required):
         if not image or not str(image).startswith("data:image"):
             return jsonify({"error": "Upload a valid image receipt"}), 400
 
-        # Silent checks: amount should match a plan; recent-looking submission only accepted for review queue
         plans = _plan_amounts(get_db)
         matched = any(abs(amount - p) < 0.01 for p in plans)
-        # Still accept into pending queue; auto-flag mismatch for admin
         flag = "" if matched else " [AMOUNT not matching a plan]"
 
         user_id = request.current_user["id"]
@@ -112,7 +173,7 @@ def register_receipt_routes(app, get_db, token_required):
         cur.execute(
             """INSERT INTO transactions (user_id, type, amount, description, status, reference)
                VALUES (?, 'deposit', ?, ?, 'pending', ?)""",
-            (user_id, amount, f"PENDING receipt upload — awaiting review", ref),
+            (user_id, amount, f"PENDING receipt upload \u2014 awaiting review", ref),
         )
         conn.commit()
         conn.close()
@@ -122,9 +183,9 @@ def register_receipt_routes(app, get_db, token_required):
             f"User: {email} (id {user_id})\n"
             f"Amount: ${amount:.2f}{flag}\n"
             f"Ref: {ref}\n"
-            f"Reply: APPROVE {rid}   or   REJECT {rid}"
+            f"Tap a button below:"
         )
-        msg_id = _telegram_send(caption, photo_b64=image)
+        msg_id = _telegram_send(caption, photo_b64=image, reply_markup=_approve_keyboard(rid))
         if msg_id:
             conn = get_db()
             conn.execute(
@@ -143,37 +204,29 @@ def register_receipt_routes(app, get_db, token_required):
             }
         )
 
-    @app.route("/api/telegram/webhook", methods=["POST"])
-    def telegram_webhook():
-        update = request.get_json() or {}
-        msg = update.get("message") or update.get("edited_message") or {}
-        text = (msg.get("text") or "").strip()
-        chat = str((msg.get("chat") or {}).get("id", ""))
-        if TELEGRAM_CHAT_ID and chat and chat != str(TELEGRAM_CHAT_ID):
-            return jsonify({"ok": True})
-
-        m = re.match(r"^(APPROVE|REJECT)\s+(\d+)$", text, re.I)
-        if not m:
-            return jsonify({"ok": True})
-
-        action, rid = m.group(1).upper(), int(m.group(2))
+    def _process_receipt_decision(action, rid, callback_query=None):
         conn = get_db()
         cur = conn.cursor()
         row = cur.execute(
             "SELECT * FROM receipts WHERE id = ?", (rid,)
         ).fetchone()
         if not row:
-            _telegram_send(f"Receipt #{rid} not found")
+            if callback_query:
+                _telegram_answer_callback(callback_query.get("id"), f"#{rid} not found")
+            else:
+                _telegram_send(f"Receipt #{rid} not found")
             conn.close()
-            return jsonify({"ok": True})
+            return
         if row["status"] != "pending":
-            _telegram_send(f"Receipt #{rid} already {row['status']}")
+            if callback_query:
+                _telegram_answer_callback(callback_query.get("id"), f"Already {row['status']}")
+            else:
+                _telegram_send(f"Receipt #{rid} already {row['status']}")
             conn.close()
-            return jsonify({"ok": True})
+            return
 
         now = datetime.datetime.utcnow().isoformat()
         if action == "APPROVE":
-            # Credit balance
             cur.execute(
                 "UPDATE users SET balance = balance + ? WHERE id = ?",
                 (row["amount"], row["user_id"]),
@@ -187,7 +240,7 @@ def register_receipt_routes(app, get_db, token_required):
                 (f"Deposit via receipt approved ${row['amount']}", row["reference"]),
             )
             conn.commit()
-            _telegram_send(f"Approved #{rid} — ${row['amount']:.2f} credited to user {row['user_id']}")
+            result_text = f"\u2705 Approved #{rid} \u2014 ${row['amount']:.2f} credited"
         else:
             cur.execute(
                 "UPDATE receipts SET status = 'rejected', reviewed_at = ? WHERE id = ?",
@@ -198,12 +251,51 @@ def register_receipt_routes(app, get_db, token_required):
                 ("Receipt rejected", row["reference"]),
             )
             conn.commit()
-            _telegram_send(f"Rejected #{rid}")
+            result_text = f"\u274c Rejected #{rid}"
 
         conn.close()
+
+        if callback_query:
+            _telegram_answer_callback(callback_query.get("id"), result_text[:200])
+            msg = callback_query.get("message") or {}
+            chat_id = (msg.get("chat") or {}).get("id")
+            message_id = msg.get("message_id")
+            if chat_id and message_id:
+                old_cap = msg.get("caption") or msg.get("text") or ""
+                _telegram_edit_caption(chat_id, message_id, f"{old_cap}\n\n{result_text}")
+        else:
+            _telegram_send(result_text)
+
+    @app.route("/api/telegram/webhook", methods=["POST"])
+    def telegram_webhook():
+        update = request.get_json() or {}
+
+        cq = update.get("callback_query")
+        if cq:
+            data = (cq.get("data") or "").strip()
+            chat = str(((cq.get("message") or {}).get("chat") or {}).get("id", ""))
+            if TELEGRAM_CHAT_ID and chat and chat != str(TELEGRAM_CHAT_ID):
+                return jsonify({"ok": True})
+            m = re.match(r"^(APPROVE|REJECT):(\d+)$", data, re.I)
+            if m:
+                action, rid = m.group(1).upper(), int(m.group(2))
+                _process_receipt_decision(action, rid, callback_query=cq)
+            return jsonify({"ok": True})
+
+        msg = update.get("message") or update.get("edited_message") or {}
+        text = (msg.get("text") or "").strip()
+        chat = str((msg.get("chat") or {}).get("id", ""))
+        if TELEGRAM_CHAT_ID and chat and chat != str(TELEGRAM_CHAT_ID):
+            return jsonify({"ok": True})
+
+        m = re.match(r"^(APPROVE|REJECT)\s+(\d+)$", text, re.I)
+        if not m:
+            return jsonify({"ok": True})
+
+        action, rid = m.group(1).upper(), int(m.group(2))
+        _process_receipt_decision(action, rid, callback_query=None)
         return jsonify({"ok": True})
 
-    # Also allow simple poll endpoint for manual approve via API if needed
     @app.route("/api/receipt/<int:rid>/decide", methods=["POST"])
     def receipt_decide(rid):
         data = request.get_json() or {}
@@ -211,7 +303,6 @@ def register_receipt_routes(app, get_db, token_required):
         if secret != os.environ.get("ADMIN_SECRET", "wealthpeak-admin-2026"):
             return jsonify({"error": "Unauthorized"}), 401
         action = (data.get("action") or "").upper()
-        # reuse webhook logic via synthetic
         with app.test_request_context(
             "/api/telegram/webhook",
             method="POST",
@@ -226,7 +317,7 @@ def register_receipt_routes(app, get_db, token_required):
 
 
 def patch_withdraw(app, get_db, token_required):
-    """Replace withdraw: block while user has active (not completed) investments."""
+    """Block withdraw while user has active investments."""
 
     @app.route("/api/withdraw", methods=["POST"])
     @token_required
@@ -240,7 +331,6 @@ def patch_withdraw(app, get_db, token_required):
         conn = get_db()
         cursor = conn.cursor()
 
-        # Block if any investment still active (end_date in future)
         active = cursor.execute(
             """
             SELECT COUNT(*) AS c FROM investments
