@@ -46,7 +46,6 @@ def _plan_amounts(get_db):
 
 
 def _approve_keyboard(rid):
-    """Inline Approve / Reject buttons."""
     return {
         "inline_keyboard": [
             [
@@ -58,9 +57,12 @@ def _approve_keyboard(rid):
 
 
 def _telegram_send(text, photo_b64=None, reply_markup=None):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN") or TELEGRAM_BOT_TOKEN
+    chat = os.environ.get("TELEGRAM_CHAT_ID") or TELEGRAM_CHAT_ID
+    if not token or not chat:
+        print("telegram missing token/chat")
         return None
-    base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    base = f"https://api.telegram.org/bot{token}"
     try:
         if photo_b64:
             raw = photo_b64
@@ -68,7 +70,7 @@ def _telegram_send(text, photo_b64=None, reply_markup=None):
                 raw = raw.split(",", 1)[1]
             data = base64.b64decode(raw)
             files = {"photo": ("receipt.jpg", data)}
-            form = {"chat_id": TELEGRAM_CHAT_ID, "caption": text[:1000]}
+            form = {"chat_id": chat, "caption": text[:1000]}
             if reply_markup:
                 form["reply_markup"] = json.dumps(reply_markup)
             r = requests.post(
@@ -77,15 +79,18 @@ def _telegram_send(text, photo_b64=None, reply_markup=None):
                 files=files,
                 timeout=30,
             )
-        else:
-            payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
-            if reply_markup:
-                payload["reply_markup"] = reply_markup
-            r = requests.post(
-                f"{base}/sendMessage",
-                json=payload,
-                timeout=20,
-            )
+            j = r.json()
+            if j.get("ok"):
+                return str(j["result"].get("message_id", ""))
+            print("telegram photo failed", j, "— falling back to text")
+        payload = {"chat_id": chat, "text": text[:4000]}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        r = requests.post(
+            f"{base}/sendMessage",
+            json=payload,
+            timeout=20,
+        )
         j = r.json()
         if j.get("ok"):
             return str(j["result"].get("message_id", ""))
@@ -96,11 +101,12 @@ def _telegram_send(text, photo_b64=None, reply_markup=None):
 
 
 def _telegram_answer_callback(callback_query_id, text):
-    if not TELEGRAM_BOT_TOKEN:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN") or TELEGRAM_BOT_TOKEN
+    if not token:
         return
     try:
         requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+            f"https://api.telegram.org/bot{token}/answerCallbackQuery",
             json={"callback_query_id": callback_query_id, "text": text, "show_alert": False},
             timeout=15,
         )
@@ -109,11 +115,12 @@ def _telegram_answer_callback(callback_query_id, text):
 
 
 def _telegram_edit_caption(chat_id, message_id, caption):
-    if not TELEGRAM_BOT_TOKEN:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN") or TELEGRAM_BOT_TOKEN
+    if not token:
         return
     try:
         requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageCaption",
+            f"https://api.telegram.org/bot{token}/editMessageCaption",
             json={
                 "chat_id": chat_id,
                 "message_id": message_id,
@@ -125,7 +132,7 @@ def _telegram_edit_caption(chat_id, message_id, caption):
     except Exception:
         try:
             requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText",
+                f"https://api.telegram.org/bot{token}/editMessageText",
                 json={
                     "chat_id": chat_id,
                     "message_id": message_id,
@@ -156,7 +163,7 @@ def register_receipt_routes(app, get_db, token_required):
 
         plans = _plan_amounts(get_db)
         matched = any(abs(amount - p) < 0.01 for p in plans)
-        flag = "" if matched else " [AMOUNT not matching a plan]"
+        flag = "" if matched else " [amount not matching a plan]"
 
         user_id = request.current_user["id"]
         email = request.current_user.get("email", "")
@@ -173,7 +180,7 @@ def register_receipt_routes(app, get_db, token_required):
         cur.execute(
             """INSERT INTO transactions (user_id, type, amount, description, status, reference)
                VALUES (?, 'deposit', ?, ?, 'pending', ?)""",
-            (user_id, amount, f"PENDING receipt upload \u2014 awaiting review", ref),
+            (user_id, amount, f"PENDING receipt upload — awaiting review", ref),
         )
         conn.commit()
         conn.close()
@@ -186,6 +193,9 @@ def register_receipt_routes(app, get_db, token_required):
             f"Tap a button below:"
         )
         msg_id = _telegram_send(caption, photo_b64=image, reply_markup=_approve_keyboard(rid))
+        if not msg_id:
+            # Force a second text attempt without photo
+            msg_id = _telegram_send(caption, photo_b64=None, reply_markup=_approve_keyboard(rid))
         if msg_id:
             conn = get_db()
             conn.execute(
@@ -201,6 +211,7 @@ def register_receipt_routes(app, get_db, token_required):
                 "reference": ref,
                 "status": "pending",
                 "id": rid,
+                "telegram": bool(msg_id),
             }
         )
 
@@ -240,7 +251,7 @@ def register_receipt_routes(app, get_db, token_required):
                 (f"Deposit via receipt approved ${row['amount']}", row["reference"]),
             )
             conn.commit()
-            result_text = f"\u2705 Approved #{rid} \u2014 ${row['amount']:.2f} credited"
+            result_text = f"\u2705 Approved #{rid} — ${row['amount']:.2f} credited"
         else:
             cur.execute(
                 "UPDATE receipts SET status = 'rejected', reviewed_at = ? WHERE id = ?",
@@ -274,7 +285,8 @@ def register_receipt_routes(app, get_db, token_required):
         if cq:
             data = (cq.get("data") or "").strip()
             chat = str(((cq.get("message") or {}).get("chat") or {}).get("id", ""))
-            if TELEGRAM_CHAT_ID and chat and chat != str(TELEGRAM_CHAT_ID):
+            expected = str(os.environ.get("TELEGRAM_CHAT_ID") or TELEGRAM_CHAT_ID or "")
+            if expected and chat and chat != expected:
                 return jsonify({"ok": True})
             m = re.match(r"^(APPROVE|REJECT):(\d+)$", data, re.I)
             if m:
@@ -285,7 +297,8 @@ def register_receipt_routes(app, get_db, token_required):
         msg = update.get("message") or update.get("edited_message") or {}
         text = (msg.get("text") or "").strip()
         chat = str((msg.get("chat") or {}).get("id", ""))
-        if TELEGRAM_CHAT_ID and chat and chat != str(TELEGRAM_CHAT_ID):
+        expected = str(os.environ.get("TELEGRAM_CHAT_ID") or TELEGRAM_CHAT_ID or "")
+        if expected and chat and chat != expected:
             return jsonify({"ok": True})
 
         m = re.match(r"^(APPROVE|REJECT)\s+(\d+)$", text, re.I)
@@ -308,7 +321,7 @@ def register_receipt_routes(app, get_db, token_required):
             method="POST",
             json={
                 "message": {
-                    "chat": {"id": TELEGRAM_CHAT_ID or "0"},
+                    "chat": {"id": os.environ.get("TELEGRAM_CHAT_ID") or TELEGRAM_CHAT_ID or "0"},
                     "text": f"{action} {rid}",
                 }
             },
@@ -317,8 +330,6 @@ def register_receipt_routes(app, get_db, token_required):
 
 
 def patch_withdraw(app, get_db, token_required):
-    """Block withdraw while user has active investments."""
-
     @app.route("/api/withdraw", methods=["POST"])
     @token_required
     def withdraw():
