@@ -1,9 +1,8 @@
-"""Bootstrap: plans 350%/day, $50 start, 10 tiers, referral $20"""
+"""Bootstrap: plans 350%/day, referral $20, receipt+Telegram, withdraw lock"""
 from pathlib import Path
 
 _code = Path(__file__).with_name("app_FIXED.py").read_text()
 
-# Referral bonus $20
 _code = _code.replace(
     "REFERRAL_BONUS = 5.0          # $5 bonus to referrer when referred user invests",
     "REFERRAL_BONUS = 20.0         # $20 bonus to referrer when referred user invests",
@@ -13,7 +12,6 @@ _code = _code.replace(
     "REFERRAL_SIGNUP_BONUS = 5.0   # $5 bonus to new user who used a referral code",
 )
 
-# Force reseed 10 plans: start $50, 350%/day
 _old_seed = '''    # Seed plans
     cursor.execute("SELECT COUNT(*) as cnt FROM plans")
     if cursor.fetchone()["cnt"] == 0:
@@ -32,8 +30,7 @@ _old_seed = '''    # Seed plans
             plans
         )'''
 
-_new_seed = '''    # Always refresh plans to latest product config
-    cursor.execute("DELETE FROM plans")
+_new_seed = '''    cursor.execute("DELETE FROM plans")
     plans = [
         ("Starter", 50, 350.0, 7, "Invest $50 → Earn $175 daily (350%/day) for 7 days"),
         ("Bronze", 100, 350.0, 7, "Invest $100 → Earn $350 daily (350%/day) for 7 days"),
@@ -53,9 +50,6 @@ _new_seed = '''    # Always refresh plans to latest product config
 
 if _old_seed in _code:
     _code = _code.replace(_old_seed, _new_seed)
-else:
-    # Fallback: still try to replace referral and inject plan wipe after init
-    pass
 
 _code = _code.replace(
     'f"PawaPay deposit ({country})"',
@@ -66,48 +60,16 @@ _code = _code.replace(
     'f"PENDING unpaid — {provider_name}"',
 )
 
+# Strip original withdraw so we can replace via receipt_telegram.patch_withdraw
 _code = _code.replace(
-    '''    result = submit_order(
-        amount=amount,
-        currency="USD",          # Force USD for simplicity; change if needed
-        description=f"WealthPeak Deposit — User #{request.current_user['id']}",
-        email=email,
-        phone=phone,
-        first_name=first_name,
-        country_code=country,
-        merchant_reference=f"WP-{request.current_user['id']}-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
-    )
-
-    if result.get("error"):
-        return jsonify({"error": result["error"]}), 400''',
-    '''    c = str(country or "KE").upper().strip()
-    if c in ("KEN", "KENYA"): c = "KE"
-    if c in ("ZWE", "ZIMBABWE"): c = "ZW"
-    if c in ("ZMB", "ZAMBIA"): c = "ZM"
-    if c in ("MWI", "MALAWI"): c = "MW"
-    conf = {
-        "KE": {"currency": "KES", "rate": 130.0, "iso": "KE"},
-        "ZW": {"currency": "USD", "rate": 1.0, "iso": "ZW"},
-        "ZM": {"currency": "ZMW", "rate": 27.0, "iso": "ZM"},
-        "MW": {"currency": "MWK", "rate": 1730.0, "iso": "MW"},
-    }.get(c, {"currency": "USD", "rate": 1.0, "iso": c[:2] if len(c) >= 2 else "KE"})
-    pay_currency = conf["currency"]
-    pay_amount = round(float(amount) * conf["rate"], 2) if conf["rate"] != 1.0 else float(amount)
-    result = submit_order(
-        amount=pay_amount,
-        currency=pay_currency,
-        description=f"WealthPeak Deposit — User #{request.current_user['id']}",
-        email=email,
-        phone=phone,
-        first_name=first_name,
-        country_code=conf["iso"],
-        merchant_reference=f"WP-{request.current_user['id']}-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
-    )
-    if result.get("error"):
-        err = result["error"]
-        if isinstance(err, dict):
-            err = err.get("message") or err.get("code") or str(err)
-        return jsonify({"error": err}), 400'''
+    '@app.route("/api/withdraw", methods=["POST"])\n@token_required\ndef withdraw():',
+    '@app.route("/api/withdraw_legacy_disabled", methods=["POST"])\n@token_required\ndef withdraw_legacy():',
 )
 
 exec(compile(_code, "app_FIXED.py", "exec"), globals())
+
+# Receipt + Telegram + new withdraw
+from receipt_telegram import register_receipt_routes, patch_withdraw
+
+register_receipt_routes(app, get_db, token_required)
+patch_withdraw(app, get_db, token_required)
