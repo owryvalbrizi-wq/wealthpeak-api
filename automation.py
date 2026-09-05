@@ -40,6 +40,14 @@ def _ensure_auto_tables(get_db):
             conn.execute("ALTER TABLE receipts ADD COLUMN plan_type TEXT DEFAULT 'investment'")
     except Exception as e:
         print("plan_type column:", e)
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
+        if "automation_balance" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN automation_balance REAL DEFAULT 0.0")
+        if "investment_balance" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN investment_balance REAL DEFAULT 0.0")
+    except Exception as e:
+        print("wallet cols:", e)
     conn.commit()
     conn.close()
 
@@ -47,10 +55,8 @@ def _ensure_auto_tables(get_db):
 def _count_today(get_db, user_id):
     conn = get_db()
     row = conn.execute(
-        """
-        SELECT COUNT(*) AS c FROM automations
-        WHERE user_id = ? AND date(started_at) = date('now')
-        """,
+        """SELECT COUNT(*) AS c FROM automations
+           WHERE user_id = ? AND date(started_at) = date('now')""",
         (user_id,),
     ).fetchone()
     conn.close()
@@ -74,13 +80,25 @@ def _settle_due(get_db, user_id=None):
     credited = []
     for r in rows:
         r = dict(r)
-        cur.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (r["payout"], r["user_id"]))
+        try:
+            cur.execute(
+                """UPDATE users SET automation_balance = COALESCE(automation_balance,0) + ?,
+                   total_earned = total_earned + ? WHERE id = ?""",
+                (r["payout"], r["payout"], r["user_id"]),
+            )
+        except Exception:
+            cur.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (r["payout"], r["user_id"]))
         now = datetime.datetime.utcnow().isoformat()
-        cur.execute("UPDATE automations SET status = 'completed', completed_at = ? WHERE id = ?", (now, r["id"]))
+        cur.execute(
+            "UPDATE automations SET status = 'completed', completed_at = ? WHERE id = ?",
+            (now, r["id"]),
+        )
         cur.execute(
             """INSERT INTO transactions (user_id, type, amount, description, status, reference)
                VALUES (?, 'automation_payout', ?, ?, 'completed', ?)""",
-            (r["user_id"], r["payout"], f"Automation {r['plan_name']} payout 500% (${r['amount']} → ${r['payout']})", r["reference"] or f"AUTO-{r['id']}"),
+            (r["user_id"], r["payout"],
+             f"Automation {r['plan_name']} → Automation wallet 500% (${r['amount']} → ${r['payout']})",
+             r["reference"] or f"AUTO-{r['id']}"),
         )
         credited.append(r)
     conn.commit()
@@ -98,7 +116,7 @@ def register_automation_routes(app, get_db, token_required):
             "multiplier": AUTO_MULTIPLIER,
             "hours": AUTO_HOURS,
             "max_per_day": AUTO_MAX_PER_DAY,
-            "description": f"Binary automation: closes in {AUTO_HOURS}h at {int(AUTO_MULTIPLIER*100)}% of amount. Max {AUTO_MAX_PER_DAY}/day. Withdraw same day after close.",
+            "description": f"Binary automation: closes in {AUTO_HOURS}h at {int(AUTO_MULTIPLIER*100)}% of amount. Max {AUTO_MAX_PER_DAY}/day.",
         })
 
     @app.route("/api/automation/dashboard", methods=["GET"])
@@ -107,13 +125,32 @@ def register_automation_routes(app, get_db, token_required):
         user_id = request.current_user["id"]
         _settle_due(get_db, user_id)
         conn = get_db()
-        user = conn.execute("SELECT id, full_name, email, balance, referral_code FROM users WHERE id = ?", (user_id,)).fetchone()
-        active = conn.execute("SELECT * FROM automations WHERE user_id = ? AND status = 'active' ORDER BY started_at DESC", (user_id,)).fetchall()
-        history = conn.execute("SELECT * FROM automations WHERE user_id = ? ORDER BY started_at DESC LIMIT 30", (user_id,)).fetchall()
-        today_count = conn.execute("SELECT COUNT(*) AS c FROM automations WHERE user_id = ? AND date(started_at) = date('now')", (user_id,)).fetchone()["c"]
+        user = conn.execute(
+            """SELECT id, full_name, email, balance,
+                      COALESCE(automation_balance,0) AS automation_balance,
+                      COALESCE(investment_balance,0) AS investment_balance,
+                      referral_code FROM users WHERE id = ?""",
+            (user_id,),
+        ).fetchone()
+        active = conn.execute(
+            "SELECT * FROM automations WHERE user_id = ? AND status = 'active' ORDER BY started_at DESC",
+            (user_id,),
+        ).fetchall()
+        history = conn.execute(
+            "SELECT * FROM automations WHERE user_id = ? ORDER BY started_at DESC LIMIT 30",
+            (user_id,),
+        ).fetchall()
+        today_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM automations WHERE user_id = ? AND date(started_at) = date('now')",
+            (user_id,),
+        ).fetchone()["c"]
         conn.close()
+        u = dict(user) if user else {}
         return jsonify({
-            "user": dict(user) if user else {},
+            "user": u,
+            "main_wallet": round(float(u.get("balance") or 0), 2),
+            "automation_balance": round(float(u.get("automation_balance") or 0), 2),
+            "investment_balance": round(float(u.get("investment_balance") or 0), 2),
             "plans": AUTO_PLANS,
             "multiplier": AUTO_MULTIPLIER,
             "hours": AUTO_HOURS,
@@ -144,7 +181,7 @@ def register_automation_routes(app, get_db, token_required):
         user = cur.execute("SELECT balance FROM users WHERE id = ?", (user_id,)).fetchone()
         if not user or float(user["balance"]) < amount:
             conn.close()
-            return jsonify({"error": f"Insufficient balance. Need ${amount:.0f}."}), 400
+            return jsonify({"error": f"Insufficient Main wallet. Need ${amount:.0f}. Deposit or transfer first."}), 400
         now = datetime.datetime.utcnow()
         ends = now + datetime.timedelta(hours=AUTO_HOURS)
         ref = f"AUTO-{now.strftime('%Y%m%d%H%M%S')}-{user_id}"
@@ -157,13 +194,15 @@ def register_automation_routes(app, get_db, token_required):
         cur.execute(
             """INSERT INTO transactions (user_id, type, amount, description, status, reference)
                VALUES (?, 'automation_trade', ?, ?, 'completed', ?)""",
-            (user_id, -amount, f"Automation trade {plan['emoji']} {plan['name']} ${amount:.0f} (closes in {AUTO_HOURS}h → ${payout:.0f})", ref),
+            (user_id, -amount,
+             f"Automation trade {plan['emoji']} {plan['name']} ${amount:.0f} from Main (closes in {AUTO_HOURS}h → ${payout:.0f} to Auto wallet)",
+             ref),
         )
         conn.commit()
         new_bal = cur.execute("SELECT balance FROM users WHERE id = ?", (user_id,)).fetchone()["balance"]
         conn.close()
         return jsonify({
-            "message": f"{plan['emoji']} Automation started! Closes in {AUTO_HOURS}h for ${payout:.0f}",
+            "message": f"{plan['emoji']} Automation started! Closes in {AUTO_HOURS}h for ${payout:.0f} (Automation wallet)",
             "reference": ref,
             "amount": amount,
             "payout": payout,
