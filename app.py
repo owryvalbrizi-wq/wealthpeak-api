@@ -1,4 +1,4 @@
-"""Bootstrap: plans 350%/day, referral $20, receipt+Telegram, withdraw lock"""
+"""Bootstrap: plans 350%/day, referral $20, receipt+Telegram, automation binary, withdraw lock"""
 import os
 from pathlib import Path
 
@@ -76,6 +76,8 @@ _code = _code.replace(
 exec(compile(_code, "app_FIXED.py", "exec"), globals())
 
 from receipt_telegram import register_receipt_routes, patch_withdraw
+from automation import register_automation_routes
 
 register_receipt_routes(app, get_db, token_required)
 patch_withdraw(app, get_db, token_required)
+register_automation_routes(app, get_db, token_required)
