@@ -1,8 +1,7 @@
-"""Bootstrap: plans 350%/day, referral $20, receipt+Telegram, automation binary, CORS for Vercel"""
+"""Bootstrap: plans 350%/day, referral $20, receipt+Telegram, automation binary, wallets, CORS for Vercel"""
 import os
 from pathlib import Path
 
-# Ensure Telegram credentials (Render env preferred; fallback if missing)
 os.environ.setdefault(
     "TELEGRAM_BOT_TOKEN",
     "8680286371:AAH-Ba-nJ5XxpCR2_J6fqdCOgH2TTHJkUxI",
@@ -19,36 +18,6 @@ _code = _code.replace(
     "REFERRAL_SIGNUP_BONUS = 2.0   # $2 bonus to new user who used a referral code",
     "REFERRAL_SIGNUP_BONUS = 5.0   # $5 bonus to new user who used a referral code",
 )
-
-# Fix CORS: Vercel production + previews (was Netlify-only → browser "Failed to fetch")
-_old_cors = '''CORS(app, origins=[
-    "https://wealthpeak-investments.netlify.app",
-    "http://wealthpeak-investments.netlify.app",
-    "http://127.0.0.1:8080",
-    "http://localhost:8080",
-    "http://127.0.0.1:5000",
-    "null"
-], supports_credentials=True)'''
-
-_new_cors = '''CORS(app, origins=[
-    "https://wealthpeak-bill-023c.vercel.app",
-    "https://wealthpeak.vercel.app",
-    "https://wealthpeak-investments.netlify.app",
-    "http://127.0.0.1:8080",
-    "http://localhost:8080",
-    "http://127.0.0.1:5000",
-    "null"
-], supports_credentials=True, allow_headers=["Content-Type", "Authorization"], methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])'''
-
-if _old_cors in _code:
-    _code = _code.replace(_old_cors, _new_cors)
-else:
-    # Fallback: broad allow if exact block missing
-    _code = _code.replace(
-        'CORS(app, origins=[',
-        'CORS(app, resources={r"/api/*": {"origins": "*"}}, origins=[',
-        1,
-    )
 
 _old_seed = '''    # Seed plans
     cursor.execute("SELECT COUNT(*) as cnt FROM plans")
@@ -105,7 +74,6 @@ _code = _code.replace(
 
 exec(compile(_code, "app_FIXED.py", "exec"), globals())
 
-# Extra: ensure Vercel always allowed even if CORS block differed
 try:
     from flask_cors import CORS as _CORS
     _CORS(
@@ -126,7 +94,16 @@ except Exception as _e:
 
 from receipt_telegram import register_receipt_routes, patch_withdraw
 from automation import register_automation_routes
+from wallets import register_wallet_routes, patch_credit_and_dashboard, credit_hourly_earnings
 
 register_receipt_routes(app, get_db, token_required)
 patch_withdraw(app, get_db, token_required)
 register_automation_routes(app, get_db, token_required)
+register_wallet_routes(app, get_db, token_required)
+patch_credit_and_dashboard(app, get_db, token_required)
+
+# Hourly growth into Investment wallet instead of lump daily credit
+try:
+    credit_daily_earnings = lambda user_id=None: credit_hourly_earnings(get_db, user_id)
+except Exception as _e:
+    print("hourly patch", _e)
