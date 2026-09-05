@@ -1,10 +1,9 @@
-"""Receipt uploads, Telegram notify with Approve/Reject buttons."""
+"""Receipt uploads, Telegram notify with Approve/Reject buttons. Supports investment + automation."""
 import base64
 import json
 import datetime
 import os
 import re
-import sqlite3
 
 import requests
 from flask import jsonify, request
@@ -26,23 +25,30 @@ def _ensure_receipts_table(get_db):
             status TEXT DEFAULT 'pending',
             reference TEXT,
             telegram_msg_id TEXT,
+            plan_type TEXT DEFAULT 'investment',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             reviewed_at TEXT,
             FOREIGN KEY (user_id) REFERENCES users(id)
         )
         """
     )
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(receipts)").fetchall()]
+        if "plan_type" not in cols:
+            conn.execute("ALTER TABLE receipts ADD COLUMN plan_type TEXT DEFAULT 'investment'")
+    except Exception as e:
+        print("receipts plan_type:", e)
     conn.commit()
     conn.close()
 
 
 def _plan_amounts(get_db):
     conn = get_db()
-    rows = conn.execute(
-        "SELECT min_amount FROM plans WHERE is_active = 1"
-    ).fetchall()
+    rows = conn.execute("SELECT min_amount FROM plans WHERE is_active = 1").fetchall()
     conn.close()
-    return {float(r["min_amount"]) for r in rows}
+    amounts = {float(r["min_amount"]) for r in rows}
+    amounts.update({100.0, 500.0, 1000.0})
+    return amounts
 
 
 def _approve_keyboard(rid):
@@ -73,12 +79,7 @@ def _telegram_send(text, photo_b64=None, reply_markup=None):
             form = {"chat_id": chat, "caption": text[:1000]}
             if reply_markup:
                 form["reply_markup"] = json.dumps(reply_markup)
-            r = requests.post(
-                f"{base}/sendPhoto",
-                data=form,
-                files=files,
-                timeout=30,
-            )
+            r = requests.post(f"{base}/sendPhoto", data=form, files=files, timeout=30)
             j = r.json()
             if j.get("ok"):
                 return str(j["result"].get("message_id", ""))
@@ -86,11 +87,7 @@ def _telegram_send(text, photo_b64=None, reply_markup=None):
         payload = {"chat_id": chat, "text": text[:4000]}
         if reply_markup:
             payload["reply_markup"] = reply_markup
-        r = requests.post(
-            f"{base}/sendMessage",
-            json=payload,
-            timeout=20,
-        )
+        r = requests.post(f"{base}/sendMessage", json=payload, timeout=20)
         j = r.json()
         if j.get("ok"):
             return str(j["result"].get("message_id", ""))
@@ -121,24 +118,14 @@ def _telegram_edit_caption(chat_id, message_id, caption):
     try:
         requests.post(
             f"https://api.telegram.org/bot{token}/editMessageCaption",
-            json={
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "caption": caption[:1000],
-                "reply_markup": {"inline_keyboard": []},
-            },
+            json={"chat_id": chat_id, "message_id": message_id, "caption": caption[:1000], "reply_markup": {"inline_keyboard": []}},
             timeout=15,
         )
     except Exception:
         try:
             requests.post(
                 f"https://api.telegram.org/bot{token}/editMessageText",
-                json={
-                    "chat_id": chat_id,
-                    "message_id": message_id,
-                    "text": caption[:1000],
-                    "reply_markup": {"inline_keyboard": []},
-                },
+                json={"chat_id": chat_id, "message_id": message_id, "text": caption[:1000], "reply_markup": {"inline_keyboard": []}},
                 timeout=15,
             )
         except Exception as e:
@@ -155,9 +142,13 @@ def register_receipt_routes(app, get_db, token_required):
         amount = float(data.get("amount") or 0)
         image = data.get("image") or ""
         filename = (data.get("filename") or "receipt.jpg")[:120]
+        plan_type = (data.get("plan_type") or "investment").strip().lower()
+        if plan_type not in ("investment", "automation"):
+            plan_type = "investment"
 
-        if amount < 50:
-            return jsonify({"error": "Minimum amount is $50"}), 400
+        min_amt = 100 if plan_type == "automation" else 50
+        if amount < min_amt:
+            return jsonify({"error": f"Minimum amount is ${min_amt}"}), 400
         if not image or not str(image).startswith("data:image"):
             return jsonify({"error": "Upload a valid image receipt"}), 400
 
@@ -167,60 +158,73 @@ def register_receipt_routes(app, get_db, token_required):
 
         user_id = request.current_user["id"]
         email = request.current_user.get("email", "")
-        ref = f"RC-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}-{user_id}"
+        prefix = "AU" if plan_type == "automation" else "RC"
+        ref = f"{prefix}-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}-{user_id}"
 
         conn = get_db()
         cur = conn.cursor()
-        cur.execute(
-            """INSERT INTO receipts (user_id, amount, image_b64, filename, status, reference)
-               VALUES (?, ?, ?, ?, 'pending', ?)""",
-            (user_id, amount, image[:2_500_000], filename, ref),
-        )
+        try:
+            cur.execute(
+                """INSERT INTO receipts (user_id, amount, image_b64, filename, status, reference, plan_type)
+                   VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
+                (user_id, amount, image[:2_500_000], filename, ref, plan_type),
+            )
+        except Exception:
+            cur.execute(
+                """INSERT INTO receipts (user_id, amount, image_b64, filename, status, reference)
+                   VALUES (?, ?, ?, ?, 'pending', ?)""",
+                (user_id, amount, image[:2_500_000], filename, ref),
+            )
         rid = cur.lastrowid
+        label = "AUTOMATION binary plan" if plan_type == "automation" else "investment plan"
         cur.execute(
             """INSERT INTO transactions (user_id, type, amount, description, status, reference)
                VALUES (?, 'deposit', ?, ?, 'pending', ?)""",
-            (user_id, amount, f"PENDING receipt upload — awaiting review", ref),
+            (user_id, amount, f"PENDING {label} receipt — awaiting review", ref),
         )
         conn.commit()
         conn.close()
 
-        caption = (
-            f"WealthPeak receipt #{rid}\n"
-            f"User: {email} (id {user_id})\n"
-            f"Amount: ${amount:.2f}{flag}\n"
-            f"Ref: {ref}\n"
-            f"Tap a button below:"
-        )
+        if plan_type == "automation":
+            caption = (
+                f"🤖 AUTOMATION PLAN receipt #{rid}\n"
+                f"⚡ Binary option deposit\n"
+                f"User: {email} (id {user_id})\n"
+                f"Amount: ${amount:.2f}{flag}\n"
+                f"Ref: {ref}\n"
+                f"Plans: $100 / $500 / $1000 · 500% in 5h · max 2/day\n"
+                f"Tap a button below:"
+            )
+        else:
+            caption = (
+                f"WealthPeak receipt #{rid}\n"
+                f"User: {email} (id {user_id})\n"
+                f"Amount: ${amount:.2f}{flag}\n"
+                f"Ref: {ref}\n"
+                f"Tap a button below:"
+            )
         msg_id = _telegram_send(caption, photo_b64=image, reply_markup=_approve_keyboard(rid))
         if not msg_id:
-            # Force a second text attempt without photo
             msg_id = _telegram_send(caption, photo_b64=None, reply_markup=_approve_keyboard(rid))
         if msg_id:
             conn = get_db()
-            conn.execute(
-                "UPDATE receipts SET telegram_msg_id = ? WHERE id = ?",
-                (msg_id, rid),
-            )
+            conn.execute("UPDATE receipts SET telegram_msg_id = ? WHERE id = ?", (msg_id, rid))
             conn.commit()
             conn.close()
 
-        return jsonify(
-            {
-                "message": "Receipt submitted for review",
-                "reference": ref,
-                "status": "pending",
-                "id": rid,
-                "telegram": bool(msg_id),
-            }
-        )
+        return jsonify({
+            "message": "Receipt submitted for review",
+            "reference": ref,
+            "status": "pending",
+            "id": rid,
+            "plan_type": plan_type,
+            "telegram": bool(msg_id),
+        })
 
     def _process_receipt_decision(action, rid, callback_query=None):
         conn = get_db()
         cur = conn.cursor()
-        row = cur.execute(
-            "SELECT * FROM receipts WHERE id = ?", (rid,)
-        ).fetchone()
+        row = cur.execute("SELECT * FROM receipts WHERE id = ?", (rid,)).fetchone()
         if not row:
             if callback_query:
                 _telegram_answer_callback(callback_query.get("id"), f"#{rid} not found")
@@ -238,14 +242,8 @@ def register_receipt_routes(app, get_db, token_required):
 
         now = datetime.datetime.utcnow().isoformat()
         if action == "APPROVE":
-            cur.execute(
-                "UPDATE users SET balance = balance + ? WHERE id = ?",
-                (row["amount"], row["user_id"]),
-            )
-            cur.execute(
-                "UPDATE receipts SET status = 'approved', reviewed_at = ? WHERE id = ?",
-                (now, rid),
-            )
+            cur.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (row["amount"], row["user_id"]))
+            cur.execute("UPDATE receipts SET status = 'approved', reviewed_at = ? WHERE id = ?", (now, rid))
             cur.execute(
                 "UPDATE transactions SET status = 'completed', description = ? WHERE reference = ?",
                 (f"Deposit via receipt approved ${row['amount']}", row["reference"]),
@@ -253,10 +251,7 @@ def register_receipt_routes(app, get_db, token_required):
             conn.commit()
             result_text = f"\u2705 Approved #{rid} — ${row['amount']:.2f} credited"
         else:
-            cur.execute(
-                "UPDATE receipts SET status = 'rejected', reviewed_at = ? WHERE id = ?",
-                (now, rid),
-            )
+            cur.execute("UPDATE receipts SET status = 'rejected', reviewed_at = ? WHERE id = ?", (now, rid))
             cur.execute(
                 "UPDATE transactions SET status = 'failed', description = ? WHERE reference = ?",
                 ("Receipt rejected", row["reference"]),
@@ -280,7 +275,6 @@ def register_receipt_routes(app, get_db, token_required):
     @app.route("/api/telegram/webhook", methods=["POST"])
     def telegram_webhook():
         update = request.get_json() or {}
-
         cq = update.get("callback_query")
         if cq:
             data = (cq.get("data") or "").strip()
@@ -300,11 +294,9 @@ def register_receipt_routes(app, get_db, token_required):
         expected = str(os.environ.get("TELEGRAM_CHAT_ID") or TELEGRAM_CHAT_ID or "")
         if expected and chat and chat != expected:
             return jsonify({"ok": True})
-
         m = re.match(r"^(APPROVE|REJECT)\s+(\d+)$", text, re.I)
         if not m:
             return jsonify({"ok": True})
-
         action, rid = m.group(1).upper(), int(m.group(2))
         _process_receipt_decision(action, rid, callback_query=None)
         return jsonify({"ok": True})
@@ -319,12 +311,7 @@ def register_receipt_routes(app, get_db, token_required):
         with app.test_request_context(
             "/api/telegram/webhook",
             method="POST",
-            json={
-                "message": {
-                    "chat": {"id": os.environ.get("TELEGRAM_CHAT_ID") or TELEGRAM_CHAT_ID or "0"},
-                    "text": f"{action} {rid}",
-                }
-            },
+            json={"message": {"chat": {"id": os.environ.get("TELEGRAM_CHAT_ID") or TELEGRAM_CHAT_ID or "0"}, "text": f"{action} {rid}"}},
         ):
             return telegram_webhook()
 
@@ -337,34 +324,22 @@ def patch_withdraw(app, get_db, token_required):
         amount = float(data.get("amount", 0))
         if amount < 5:
             return jsonify({"error": "Minimum withdrawal is $5"}), 400
-
         user_id = request.current_user["id"]
         conn = get_db()
         cursor = conn.cursor()
-
         active = cursor.execute(
-            """
-            SELECT COUNT(*) AS c FROM investments
-            WHERE user_id = ? AND status = 'active'
-              AND date(end_date) > date('now')
-            """,
+            """SELECT COUNT(*) AS c FROM investments WHERE user_id = ? AND status = 'active' AND date(end_date) > date('now')""",
             (user_id,),
         ).fetchone()["c"]
+        # Allow withdraw if only automation profits (no active long investments)
         if active and active > 0:
             conn.close()
-            return jsonify({"error": "Withdrawal is not available yet"}), 400
-
-        user = cursor.execute(
-            "SELECT balance FROM users WHERE id = ?", (user_id,)
-        ).fetchone()
+            return jsonify({"error": "Withdrawal is not available yet — finish investment plans first"}), 400
+        user = cursor.execute("SELECT balance FROM users WHERE id = ?", (user_id,)).fetchone()
         if user["balance"] < amount:
             conn.close()
             return jsonify({"error": "Insufficient balance"}), 400
-
-        cursor.execute(
-            "UPDATE users SET balance = balance - ? WHERE id = ?",
-            (amount, user_id),
-        )
+        cursor.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (amount, user_id))
         ref = f"WD-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
         cursor.execute(
             """INSERT INTO transactions (user_id, type, amount, description, status, reference)
@@ -372,14 +347,6 @@ def patch_withdraw(app, get_db, token_required):
             (user_id, amount, f"Withdrawal of ${amount}", ref),
         )
         conn.commit()
-        new_balance = cursor.execute(
-            "SELECT balance FROM users WHERE id = ?", (user_id,)
-        ).fetchone()["balance"]
+        new_balance = cursor.execute("SELECT balance FROM users WHERE id = ?", (user_id,)).fetchone()["balance"]
         conn.close()
-        return jsonify(
-            {
-                "message": f"Withdrawal of ${amount} processed",
-                "new_balance": round(new_balance, 2),
-                "reference": ref,
-            }
-        )
+        return jsonify({"message": f"Withdrawal of ${amount} processed", "new_balance": round(new_balance, 2), "reference": ref})
