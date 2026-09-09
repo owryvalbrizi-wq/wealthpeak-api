@@ -242,14 +242,27 @@ def register_receipt_routes(app, get_db, token_required):
 
         now = datetime.datetime.utcnow().isoformat()
         if action == "APPROVE":
-            cur.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (row["amount"], row["user_id"]))
+            plan_type = (row["plan_type"] if "plan_type" in row.keys() else None) or "investment"
+            try:
+                plan_type = str(plan_type).strip().lower()
+            except Exception:
+                plan_type = "investment"
+            if plan_type == "automation":
+                cur.execute(
+                    "UPDATE users SET automation_balance = COALESCE(automation_balance,0) + ? WHERE id = ?",
+                    (row["amount"], row["user_id"]),
+                )
+                credit_msg = f"Automation wallet +${row['amount']:.2f}"
+            else:
+                cur.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (row["amount"], row["user_id"]))
+                credit_msg = f"Main wallet +${row['amount']:.2f}"
             cur.execute("UPDATE receipts SET status = 'approved', reviewed_at = ? WHERE id = ?", (now, rid))
             cur.execute(
                 "UPDATE transactions SET status = 'completed', description = ? WHERE reference = ?",
-                (f"Deposit via receipt approved ${row['amount']}", row["reference"]),
+                (f"Deposit via receipt approved ${row['amount']:.2f} ({credit_msg})", row["reference"]),
             )
             conn.commit()
-            result_text = f"\u2705 Approved #{rid} — ${row['amount']:.2f} credited"
+            result_text = f"\u2705 Approved #{rid} — ${row['amount']:.2f} · {credit_msg}"
         else:
             cur.execute("UPDATE receipts SET status = 'rejected', reviewed_at = ? WHERE id = ?", (now, rid))
             cur.execute(
