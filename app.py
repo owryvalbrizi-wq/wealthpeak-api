@@ -1,4 +1,4 @@
-"""Bootstrap: plans 350%/day, referral $20, receipt+Telegram, automation binary, wallets, CORS for Vercel"""
+"""Bootstrap: plans 350%/day, referral $20, receipt+Telegram, automation binary, wallets, CORS for Vercel, ZetuPay Kenya"""
 import os
 from pathlib import Path
 
@@ -95,12 +95,14 @@ except Exception as _e:
 from receipt_telegram import register_receipt_routes, patch_withdraw
 from automation import register_automation_routes
 from wallets import register_wallet_routes, patch_credit_and_dashboard, credit_hourly_earnings
+from zetupay import register_zetupay_routes
 
 register_receipt_routes(app, get_db, token_required)
 patch_withdraw(app, get_db, token_required)
 register_automation_routes(app, get_db, token_required)
 register_wallet_routes(app, get_db, token_required)
 patch_credit_and_dashboard(app, get_db, token_required)
+register_zetupay_routes(app, get_db, token_required)
 
 # Hourly growth into Investment wallet instead of lump daily credit
 try:
