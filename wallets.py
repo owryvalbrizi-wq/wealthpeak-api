@@ -170,6 +170,7 @@ def register_wallet_routes(app, get_db, token_required):
             },
         })
 
+    @app.route("/api/transfer", methods=["POST"])
     @app.route("/api/wallets/transfer", methods=["POST"])
     @token_required
     def transfer_to_main():
